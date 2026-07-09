@@ -143,6 +143,78 @@ def masked_bce_loss(
     return (loss * valid).sum() / valid.sum().clamp_min(1.0)
 
 
+def masked_tversky_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+    alpha: float,
+    beta: float,
+    gamma: float = 1.0,
+    smooth: float = 1.0,
+) -> torch.Tensor:
+    """Tversky/Focal-Tversky loss over valid cells.
+
+    alpha weights false positives and beta weights false negatives. For smoke
+    coverage, alpha > beta is useful when the model paints the plume too wide.
+    """
+    prob = torch.sigmoid(logits)
+    prob = prob * valid
+    target = target * valid
+    true_pos = (prob * target).sum()
+    false_pos = (prob * (1.0 - target) * valid).sum()
+    false_neg = ((1.0 - prob) * target * valid).sum()
+    score = (true_pos + smooth) / (true_pos + alpha * false_pos + beta * false_neg + smooth)
+    return torch.pow(1.0 - score, gamma)
+
+
+def masked_dice_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+    smooth: float = 1.0,
+) -> torch.Tensor:
+    prob = torch.sigmoid(logits) * valid
+    target = target * valid
+    intersection = (prob * target).sum()
+    denominator = prob.sum() + target.sum()
+    score = (2.0 * intersection + smooth) / (denominator + smooth)
+    return 1.0 - score
+
+
+def compute_masked_loss(
+    loss_name: str,
+    bce_criterion: nn.Module,
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+    bce_weight: float,
+    dice_weight: float,
+    tversky_alpha: float,
+    tversky_beta: float,
+    focal_gamma: float,
+) -> torch.Tensor:
+    bce = masked_bce_loss(bce_criterion, logits, target, valid)
+    if loss_name == "bce":
+        return bce
+    if loss_name == "dice":
+        return masked_dice_loss(logits, target, valid)
+    if loss_name == "tversky":
+        return masked_tversky_loss(logits, target, valid, tversky_alpha, tversky_beta)
+    if loss_name == "focal_tversky":
+        return masked_tversky_loss(logits, target, valid, tversky_alpha, tversky_beta, focal_gamma)
+    if loss_name == "bce_dice":
+        return bce_weight * bce + dice_weight * masked_dice_loss(logits, target, valid)
+    if loss_name == "bce_tversky":
+        return bce_weight * bce + dice_weight * masked_tversky_loss(
+            logits,
+            target,
+            valid,
+            tversky_alpha,
+            tversky_beta,
+        )
+    raise ValueError(f"Unsupported loss: {loss_name}")
+
+
 @torch.no_grad()
 def predict(model: nn.Module, loader: DataLoader, device: torch.device) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     model.eval()
@@ -322,6 +394,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-channels", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--pos-weight-cap", type=float, default=20.0)
+    parser.add_argument(
+        "--loss",
+        choices=["bce", "dice", "tversky", "focal_tversky", "bce_dice", "bce_tversky"],
+        default="bce",
+    )
+    parser.add_argument("--bce-weight", type=float, default=0.3)
+    parser.add_argument("--dice-weight", type=float, default=0.7)
+    parser.add_argument("--tversky-alpha", type=float, default=0.7)
+    parser.add_argument("--tversky-beta", type=float, default=0.3)
+    parser.add_argument("--focal-gamma", type=float, default=1.33)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max-examples", type=int, default=4)
     parser.add_argument("--example-threshold", type=float, default=0.50)
@@ -377,7 +459,18 @@ def main() -> int:
             vb = vb.to(device)
             optimizer.zero_grad(set_to_none=True)
             logits = model(xb)
-            loss = masked_bce_loss(criterion, logits, yb, vb)
+            loss = compute_masked_loss(
+                args.loss,
+                criterion,
+                logits,
+                yb,
+                vb,
+                args.bce_weight,
+                args.dice_weight,
+                args.tversky_alpha,
+                args.tversky_beta,
+                args.focal_gamma,
+            )
             loss.backward()
             optimizer.step()
             total_loss += float(loss.detach().cpu()) * float(vb.sum().cpu())
@@ -402,6 +495,12 @@ def main() -> int:
         "patch_size": int(x.shape[-1]),
         "pos_weight": float(pos_weight),
         "pos_weight_cap": float(args.pos_weight_cap),
+        "loss": args.loss,
+        "bce_weight": float(args.bce_weight),
+        "dice_weight": float(args.dice_weight),
+        "tversky_alpha": float(args.tversky_alpha),
+        "tversky_beta": float(args.tversky_beta),
+        "focal_gamma": float(args.focal_gamma),
         "history": history,
         "train_eval": evaluate_pixels(train_y, train_prob, train_valid),
         "test_eval": evaluate_pixels(test_y, test_prob, test_valid),

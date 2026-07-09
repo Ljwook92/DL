@@ -40,13 +40,18 @@ pip install -r smoke_coverage_unet_10km/requirements.txt
 ```bash
 python smoke_coverage_unet_10km/scripts/train_temporal_unet_smoke_coverage.py \
   --dataset-dir smoke_coverage_unet_10km/data \
-  --output-dir smoke_coverage_unet_10km/hpc_runs/unet_cuda_poscap5 \
+  --output-dir smoke_coverage_unet_10km/hpc_runs/unet_cuda_tversky_fp70 \
   --train-periods 202406 202407 202408 202409 202410 \
   --test-periods 202506 202507 202508 202509 202510 \
   --epochs 80 \
   --batch-size 8 \
   --base-channels 32 \
-  --pos-weight-cap 5 \
+  --pos-weight-cap 2 \
+  --loss bce_tversky \
+  --bce-weight 0.3 \
+  --dice-weight 0.7 \
+  --tversky-alpha 0.7 \
+  --tversky-beta 0.3 \
   --device cuda \
   --example-threshold 0.5
 ```
@@ -58,6 +63,8 @@ The main coverage metric is fire-day patch IoU:
 
 ## Current Local Baseline
 
-The local MPS pilot used 12 epochs, batch size 2, and base channels 16. It ran
-successfully but did not beat the tabular HGB baseline by IoU. The next HPC runs
-should test deeper U-Net capacity, longer training, and IoU/Dice-oriented loss.
+The local MPS pilot used 12 epochs, batch size 2, and base channels 16. The
+first HPC run used 80 epochs, batch size 8, and base channels 32 with BCE loss.
+It ran successfully but still did not beat the tabular HGB baseline by IoU. The
+recommended next run is `bce_tversky` with `tversky-alpha=0.7` and
+`tversky-beta=0.3`, which penalizes false-positive plume area more strongly.
