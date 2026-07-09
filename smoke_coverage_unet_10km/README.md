@@ -42,20 +42,22 @@ pip install -r smoke_coverage_unet_10km/requirements.txt
 ## Train
 
 Recommended HPC run: use the HGB probability field as the prior and train the
-CNN as a residual spatial-refinement model.
+higher-capacity `resattn_unetpp` CNN as a residual spatial-refinement model.
 
 ```bash
 python smoke_coverage_unet_10km/scripts/train_temporal_unet_smoke_coverage.py \
   --dataset-npz smoke_coverage_unet_10km/data/temporal_unet_patch_dataset_hgb_prior.npz \
   --metadata-csv smoke_coverage_unet_10km/data/temporal_unet_patch_metadata_hgb_prior.csv \
   --channels-json smoke_coverage_unet_10km/data/temporal_unet_channels_hgb_prior.json \
-  --output-dir smoke_coverage_unet_10km/hpc_runs/hgb_prior_resunet_bce \
+  --output-dir smoke_coverage_unet_10km/hpc_runs/hgb_prior_resattn_unetpp_bc48 \
   --train-periods 202406 202407 202408 202409 202410 \
   --test-periods 202506 202507 202508 202509 202510 \
-  --epochs 80 \
-  --batch-size 8 \
-  --base-channels 32 \
-  --learning-rate 0.0001 \
+  --epochs 60 \
+  --batch-size 4 \
+  --model resattn_unetpp \
+  --base-channels 48 \
+  --dropout 0.10 \
+  --learning-rate 0.00005 \
   --pos-weight-cap 5 \
   --loss bce \
   --residual-prior-channel hgb_prior_prob_smoke \
@@ -77,5 +79,6 @@ The main coverage metric is fire-day patch IoU:
 
 The local MPS pilot used 12 epochs, batch size 2, and base channels 16. The
 first HPC pure U-Net runs did not beat the tabular HGB baseline by IoU. The
-recommended next run is a hybrid residual model: HGB supplies the cell-level
-probability prior and the CNN learns a spatial correction to that prior.
+recommended next run is a higher-capacity hybrid residual model: HGB supplies
+the cell-level probability prior and `resattn_unetpp` learns a spatial
+correction to that prior.

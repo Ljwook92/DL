@@ -70,6 +70,116 @@ class ConvBlock(nn.Module):
         return self.net(x)
 
 
+class SqueezeExcite(nn.Module):
+    def __init__(self, channels: int, reduction: int = 8):
+        super().__init__()
+        hidden = max(channels // reduction, 4)
+        self.net = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, hidden, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.net(x)
+
+
+class ResidualSEBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, dropout: float = 0.0):
+        super().__init__()
+        layers: list[nn.Module] = [
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        ]
+        if dropout > 0:
+            layers.append(nn.Dropout2d(dropout))
+        layers.extend(
+            [
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                SqueezeExcite(out_channels),
+            ]
+        )
+        self.block = nn.Sequential(*layers)
+        self.skip = (
+            nn.Identity()
+            if in_channels == out_channels
+            else nn.Sequential(nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False), nn.BatchNorm2d(out_channels))
+        )
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.block(x) + self.skip(x))
+
+
+class AttentionGate(nn.Module):
+    def __init__(self, skip_channels: int, gate_channels: int, inter_channels: int):
+        super().__init__()
+        self.skip_proj = nn.Sequential(
+            nn.Conv2d(skip_channels, inter_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_channels),
+        )
+        self.gate_proj = nn.Sequential(
+            nn.Conv2d(gate_channels, inter_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_channels),
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(inter_channels, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, skip: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        attention = self.psi(self.act(self.skip_proj(skip) + self.gate_proj(gate)))
+        return skip * attention
+
+
+class ASPP(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, rates: tuple[int, ...] = (1, 2, 4, 8)):
+        super().__init__()
+        branches = []
+        for rate in rates:
+            branches.append(
+                nn.Sequential(
+                    nn.Conv2d(
+                        in_channels,
+                        out_channels,
+                        kernel_size=1 if rate == 1 else 3,
+                        padding=0 if rate == 1 else rate,
+                        dilation=rate,
+                        bias=False,
+                    ),
+                    nn.BatchNorm2d(out_channels),
+                    nn.ReLU(inplace=True),
+                )
+            )
+        self.branches = nn.ModuleList(branches)
+        self.project = nn.Sequential(
+            nn.Conv2d(out_channels * len(rates), out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.project(torch.cat([branch(x) for branch in self.branches], dim=1))
+
+
+class UpAttentionBlock(nn.Module):
+    def __init__(self, in_channels: int, skip_channels: int, out_channels: int, dropout: float = 0.0):
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.attn = AttentionGate(skip_channels, out_channels, max(out_channels // 2, 8))
+        self.conv = ResidualSEBlock(out_channels + skip_channels, out_channels, dropout)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.up(x)
+        skip = self.attn(skip, x)
+        return self.conv(torch.cat([x, skip], dim=1))
+
+
 class SmallUNet(nn.Module):
     def __init__(self, in_channels: int, base_channels: int = 16):
         super().__init__()
@@ -93,6 +203,59 @@ class SmallUNet(nn.Module):
         d1 = self.up1(d2)
         d1 = self.dec1(torch.cat([d1, e1], dim=1))
         return self.out(d1)
+
+
+class ResAttentionUNetPP(nn.Module):
+    """Residual Attention U-Net variant with SE blocks and ASPP bottleneck.
+
+    This is the higher-capacity HPC model. It is intentionally dependency-free
+    so the same training bundle runs on clusters without extra segmentation
+    libraries.
+    """
+
+    def __init__(self, in_channels: int, base_channels: int = 32, dropout: float = 0.05):
+        super().__init__()
+        c1 = base_channels
+        c2 = base_channels * 2
+        c3 = base_channels * 4
+        c4 = base_channels * 8
+        c5 = base_channels * 16
+
+        self.enc1 = ResidualSEBlock(in_channels, c1, dropout)
+        self.enc2 = ResidualSEBlock(c1, c2, dropout)
+        self.enc3 = ResidualSEBlock(c2, c3, dropout)
+        self.enc4 = ResidualSEBlock(c3, c4, dropout)
+        self.pool = nn.MaxPool2d(2)
+        self.bottleneck = nn.Sequential(
+            ResidualSEBlock(c4, c5, dropout),
+            ASPP(c5, c5),
+            ResidualSEBlock(c5, c5, dropout),
+        )
+        self.dec4 = UpAttentionBlock(c5, c4, c4, dropout)
+        self.dec3 = UpAttentionBlock(c4, c3, c3, dropout)
+        self.dec2 = UpAttentionBlock(c3, c2, c2, dropout)
+        self.dec1 = UpAttentionBlock(c2, c1, c1, dropout)
+        self.out = nn.Conv2d(c1, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
+        e4 = self.enc4(self.pool(e3))
+        b = self.bottleneck(self.pool(e4))
+        d4 = self.dec4(b, e4)
+        d3 = self.dec3(d4, e3)
+        d2 = self.dec2(d3, e2)
+        d1 = self.dec1(d2, e1)
+        return self.out(d1)
+
+
+def build_model(model_name: str, in_channels: int, base_channels: int, dropout: float) -> nn.Module:
+    if model_name == "unet":
+        return SmallUNet(in_channels=in_channels, base_channels=base_channels)
+    if model_name == "resattn_unetpp":
+        return ResAttentionUNetPP(in_channels=in_channels, base_channels=base_channels, dropout=dropout)
+    raise ValueError(f"Unsupported model: {model_name}")
 
 
 def choose_device(name: str) -> torch.device:
@@ -416,7 +579,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-periods", nargs="+", default=["202506", "202507", "202508", "202509", "202510"])
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--model", choices=["unet", "resattn_unetpp"], default="unet")
     parser.add_argument("--base-channels", type=int, default=16)
+    parser.add_argument("--dropout", type=float, default=0.05)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--pos-weight-cap", type=float, default=20.0)
     parser.add_argument(
@@ -480,7 +645,7 @@ def main() -> int:
     pos = float((y[train_idx] * valid[train_idx]).sum())
     neg = float(valid[train_idx].sum() - pos)
     pos_weight = min(max(neg / max(pos, 1.0), 1.0), args.pos_weight_cap)
-    model = SmallUNet(in_channels=x.shape[1], base_channels=args.base_channels).to(device)
+    model = build_model(args.model, in_channels=x.shape[1], base_channels=args.base_channels, dropout=args.dropout).to(device)
     if args.zero_init_output:
         nn.init.zeros_(model.out.weight)
         nn.init.zeros_(model.out.bias)
@@ -533,6 +698,8 @@ def main() -> int:
         "channels": channel_names,
         "channel_count": int(x.shape[1]),
         "patch_size": int(x.shape[-1]),
+        "model": args.model,
+        "dropout": float(args.dropout),
         "pos_weight": float(pos_weight),
         "pos_weight_cap": float(args.pos_weight_cap),
         "loss": args.loss,
