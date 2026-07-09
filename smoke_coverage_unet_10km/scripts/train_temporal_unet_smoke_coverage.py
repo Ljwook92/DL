@@ -23,21 +23,34 @@ DEFAULT_DATASET_DIR = Path(
 
 
 class PatchDataset(Dataset):
-    def __init__(self, x: np.ndarray, y: np.ndarray, valid: np.ndarray, indices: np.ndarray):
+    def __init__(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        valid: np.ndarray,
+        indices: np.ndarray,
+        prior_logits: np.ndarray | None = None,
+    ):
         self.x = x
         self.y = y
         self.valid = valid
         self.indices = indices.astype(int)
+        self.prior_logits = prior_logits
 
     def __len__(self) -> int:
         return int(len(self.indices))
 
-    def __getitem__(self, item: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, item: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         idx = self.indices[item]
+        if self.prior_logits is None:
+            prior = np.zeros_like(self.y[idx], dtype=np.float32)
+        else:
+            prior = self.prior_logits[idx].astype(np.float32)
         return (
             torch.from_numpy(self.x[idx]),
             torch.from_numpy(self.y[idx]),
             torch.from_numpy(self.valid[idx]),
+            torch.from_numpy(prior),
         )
 
 
@@ -133,6 +146,17 @@ def split_indices(metadata: pd.DataFrame, train_periods: list[str], test_periods
     return train_idx, test_idx
 
 
+def build_prior_logits(x: np.ndarray, channel_names: list[str], prior_channel: str, eps: float = 1e-4) -> np.ndarray | None:
+    if not prior_channel:
+        return None
+    if prior_channel not in channel_names:
+        raise ValueError(f"Prior channel not found: {prior_channel}")
+    channel_idx = channel_names.index(prior_channel)
+    prior = x[:, channel_idx : channel_idx + 1].copy()
+    prior = np.clip(prior, eps, 1.0 - eps)
+    return np.log(prior / (1.0 - prior)).astype(np.float32)
+
+
 def masked_bce_loss(
     criterion: nn.Module,
     logits: torch.Tensor,
@@ -221,9 +245,10 @@ def predict(model: nn.Module, loader: DataLoader, device: torch.device) -> tuple
     probs = []
     targets = []
     valids = []
-    for x, y, valid in loader:
+    for x, y, valid, prior_logits in loader:
         x = x.to(device)
-        logits = model(x)
+        prior_logits = prior_logits.to(device)
+        logits = model(x) + prior_logits
         probs.append(torch.sigmoid(logits).cpu().numpy())
         targets.append(y.numpy())
         valids.append(valid.numpy())
@@ -404,6 +429,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tversky-alpha", type=float, default=0.7)
     parser.add_argument("--tversky-beta", type=float, default=0.3)
     parser.add_argument("--focal-gamma", type=float, default=1.33)
+    parser.add_argument(
+        "--residual-prior-channel",
+        default="",
+        help="If set, model output is a logit residual added to this raw probability channel.",
+    )
+    parser.add_argument(
+        "--zero-init-output",
+        action="store_true",
+        help="Initialize final conv to zero so residual-prior mode starts exactly from the prior.",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max-examples", type=int, default=4)
     parser.add_argument("--example-threshold", type=float, default=0.50)
@@ -428,6 +463,7 @@ def main() -> int:
     channel_names = channels_payload["channels"]
 
     train_idx, test_idx = split_indices(metadata, args.train_periods, args.test_periods)
+    prior_logits = build_prior_logits(x, channel_names, args.residual_prior_channel)
     x, normalization = normalize_inputs(x, valid, metadata, train_idx, channel_names)
 
     rng = np.random.default_rng(args.random_state)
@@ -436,8 +472,8 @@ def main() -> int:
     train_idx = rng.permutation(train_idx)
     device = choose_device(args.device)
 
-    train_ds = PatchDataset(x, y, valid, train_idx)
-    test_ds = PatchDataset(x, y, valid, test_idx)
+    train_ds = PatchDataset(x, y, valid, train_idx, prior_logits)
+    test_ds = PatchDataset(x, y, valid, test_idx, prior_logits)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
@@ -445,6 +481,9 @@ def main() -> int:
     neg = float(valid[train_idx].sum() - pos)
     pos_weight = min(max(neg / max(pos, 1.0), 1.0), args.pos_weight_cap)
     model = SmallUNet(in_channels=x.shape[1], base_channels=args.base_channels).to(device)
+    if args.zero_init_output:
+        nn.init.zeros_(model.out.weight)
+        nn.init.zeros_(model.out.bias)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
     criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=torch.tensor([pos_weight], device=device).view(1, 1, 1, 1))
 
@@ -453,12 +492,13 @@ def main() -> int:
         model.train()
         total_loss = 0.0
         total_valid = 0.0
-        for xb, yb, vb in train_loader:
+        for xb, yb, vb, priorb in train_loader:
             xb = xb.to(device)
             yb = yb.to(device)
             vb = vb.to(device)
+            priorb = priorb.to(device)
             optimizer.zero_grad(set_to_none=True)
-            logits = model(xb)
+            logits = model(xb) + priorb
             loss = compute_masked_loss(
                 args.loss,
                 criterion,
@@ -501,6 +541,8 @@ def main() -> int:
         "tversky_alpha": float(args.tversky_alpha),
         "tversky_beta": float(args.tversky_beta),
         "focal_gamma": float(args.focal_gamma),
+        "residual_prior_channel": args.residual_prior_channel,
+        "zero_init_output": bool(args.zero_init_output),
         "history": history,
         "train_eval": evaluate_pixels(train_y, train_prob, train_valid),
         "test_eval": evaluate_pixels(test_y, test_prob, test_valid),

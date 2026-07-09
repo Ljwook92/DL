@@ -9,6 +9,10 @@ coverage pilot.
   - `x`: `(257, 80, 128, 128)` float32 input tensor
   - `y`: `(257, 1, 128, 128)` float32 next-day HMS smoke label mask
   - `valid`: `(257, 1, 128, 128)` float32 valid-cell mask
+- `data/temporal_unet_patch_dataset_hgb_prior.npz`
+  - `x`: `(257, 81, 128, 128)` float32 input tensor
+  - the additional channel is `hgb_prior_prob_smoke`
+  - use this for the hybrid HGB-prior residual U-Net
 - `data/temporal_unet_patch_metadata.csv`
   - one row per fire-day patch
   - train periods: `202406` to `202410`
@@ -37,24 +41,32 @@ pip install -r smoke_coverage_unet_10km/requirements.txt
 
 ## Train
 
+Recommended HPC run: use the HGB probability field as the prior and train the
+CNN as a residual spatial-refinement model.
+
 ```bash
 python smoke_coverage_unet_10km/scripts/train_temporal_unet_smoke_coverage.py \
-  --dataset-dir smoke_coverage_unet_10km/data \
-  --output-dir smoke_coverage_unet_10km/hpc_runs/unet_cuda_tversky_fp70 \
+  --dataset-npz smoke_coverage_unet_10km/data/temporal_unet_patch_dataset_hgb_prior.npz \
+  --metadata-csv smoke_coverage_unet_10km/data/temporal_unet_patch_metadata_hgb_prior.csv \
+  --channels-json smoke_coverage_unet_10km/data/temporal_unet_channels_hgb_prior.json \
+  --output-dir smoke_coverage_unet_10km/hpc_runs/hgb_prior_resunet_bce \
   --train-periods 202406 202407 202408 202409 202410 \
   --test-periods 202506 202507 202508 202509 202510 \
   --epochs 80 \
   --batch-size 8 \
   --base-channels 32 \
-  --pos-weight-cap 2 \
-  --loss bce_tversky \
-  --bce-weight 0.3 \
-  --dice-weight 0.7 \
-  --tversky-alpha 0.7 \
-  --tversky-beta 0.3 \
+  --learning-rate 0.0001 \
+  --pos-weight-cap 5 \
+  --loss bce \
+  --residual-prior-channel hgb_prior_prob_smoke \
+  --zero-init-output \
   --device cuda \
   --example-threshold 0.5
 ```
+
+The older pure U-Net tensor can still be used by passing `--dataset-dir
+smoke_coverage_unet_10km/data`, but the hybrid prior run is the preferred HPC
+experiment.
 
 The main coverage metric is fire-day patch IoU:
 
@@ -64,7 +76,6 @@ The main coverage metric is fire-day patch IoU:
 ## Current Local Baseline
 
 The local MPS pilot used 12 epochs, batch size 2, and base channels 16. The
-first HPC run used 80 epochs, batch size 8, and base channels 32 with BCE loss.
-It ran successfully but still did not beat the tabular HGB baseline by IoU. The
-recommended next run is `bce_tversky` with `tversky-alpha=0.7` and
-`tversky-beta=0.3`, which penalizes false-positive plume area more strongly.
+first HPC pure U-Net runs did not beat the tabular HGB baseline by IoU. The
+recommended next run is a hybrid residual model: HGB supplies the cell-level
+probability prior and the CNN learns a spatial correction to that prior.
